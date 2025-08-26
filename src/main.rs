@@ -33,6 +33,8 @@ const DEDUP_WINDOW: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() {
+    println!("Starting Minecraft Banbot...");
+    println!("{}{}", console::style("action log for fail2ban or similar like this: ").red(), console::style("tcp/25565 abuse detected for ip=the_ip_here").magenta());
     // Channel for sending IPs to process()
     let (tx, rx) = std::sync::mpsc::channel::<(SocketAddr, &'static str)>();
 
@@ -236,7 +238,7 @@ async fn process(addr: SocketAddr, kind: &str, dedup_map: DedupMap) -> Result<()
         println!("Multiple abuse reports detected for IP: {}", ip);
     }
     if high_abuse || many_reports {
-        println!("tcp/{} abuse detected for IP: {}", *PORT, ip);
+        println!("{}", console::style(format!("tcp/{} abuse detected for ip={}", *PORT, ip)).magenta());
     }
 
     Ok(())
