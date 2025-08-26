@@ -26,6 +26,10 @@ lazy_static::lazy_static! {
         dotenv().ok();
         env::var("HOST").unwrap_or_else(|_| "0.0.0.0".into())
     };
+    pub static ref DEVICE: String = {
+        dotenv().ok();
+        env::var("DEVICE").unwrap_or_else(|_| "any".into())
+    };
 }
 
 type DedupMap = Arc<Mutex<HashMap<std::net::IpAddr, Instant>>>;
@@ -34,7 +38,11 @@ const DEDUP_WINDOW: Duration = Duration::from_secs(30);
 #[tokio::main]
 async fn main() {
     println!("Starting Minecraft Banbot...");
-    println!("{}{}", console::style("action log for fail2ban or similar like this: ").red(), console::style("tcp/25565 abuse detected for ip=the_ip_here").magenta());
+    println!(
+        "{}{}",
+        console::style("action log for fail2ban or similar like this: ").red(),
+        console::style("tcp/25565 abuse detected for ip=the_ip_here").magenta()
+    );
     // Channel for sending IPs to process()
     let (tx, rx) = std::sync::mpsc::channel::<(SocketAddr, &'static str)>();
 
@@ -49,10 +57,12 @@ async fn main() {
     thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
-            let listener = TcpListener::bind(format!("{}:{}", *HOST, *PORT)).await.unwrap_or_else(|e| {
-                eprintln!("Failed to bind to port 25565: {e}");
-                std::process::exit(1);
-            });
+            let listener = TcpListener::bind(format!("{}:{}", *HOST, *PORT))
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to bind to port 25565: {e}");
+                    std::process::exit(1);
+                });
             println!("Listening on {}:{}", *HOST, *PORT);
             loop {
                 match listener.accept().await {
@@ -78,16 +88,35 @@ async fn main() {
         use pcap::{Capture, Device};
 
         // This code gets all devices to sniff for packets
-        let devices = match Device::list() {
+        let mut devices = match Device::list() {
             Ok(devs) => devs,
             Err(e) => {
                 eprintln!("Failed to list devices: {e}");
                 return;
             }
         };
-        println!("Sniffing on all devices:");
-        for dev in &devices {
-            println!("  {}", dev.name);
+
+        match DEVICE.as_str() {
+            "any" => {
+                println!("{}", DEVICE.as_str());
+                println!("Sniffing on all devices:");
+                for dev in &devices {
+                    println!("  {}", dev.name);
+                }
+            } // Use all devices
+            dev_name => {
+                // Filter to only the specified device
+                if let Some(dev) = devices.iter().find(|d| d.name == dev_name) {
+                    println!("Sniffing on device: {}", dev.name);
+                    devices = vec![dev.clone()];
+                } else {
+                    eprintln!("Device '{}' not found. Available devices:", dev_name);
+                    for dev in &devices {
+                        eprintln!("  {}", dev.name);
+                    }
+                    return;
+                }
+            }
         }
 
         // For each device, spawn a sniffer thread
@@ -170,7 +199,11 @@ async fn main() {
 }
 
 // --- Process function: handles abuse checks and deduplication for each event ---
-async fn process(addr: SocketAddr, kind: &str, dedup_map: DedupMap) -> Result<(), Box<dyn std::error::Error>> {
+async fn process(
+    addr: SocketAddr,
+    kind: &str,
+    dedup_map: DedupMap,
+) -> Result<(), Box<dyn std::error::Error>> {
     match kind {
         "full_conn" => println!("Processing FULL connection from: {addr}"),
         "syn_scan" => println!("Detected SYN scan from: {addr}"),
@@ -238,7 +271,10 @@ async fn process(addr: SocketAddr, kind: &str, dedup_map: DedupMap) -> Result<()
         println!("Multiple abuse reports detected for IP: {}", ip);
     }
     if high_abuse || many_reports {
-        println!("{}", console::style(format!("tcp/{} abuse detected for ip={}", *PORT, ip)).magenta());
+        println!(
+            "{}",
+            console::style(format!("tcp/{} abuse detected for ip={}", *PORT, ip)).magenta()
+        );
     }
 
     Ok(())
