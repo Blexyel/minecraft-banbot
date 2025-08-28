@@ -16,19 +16,21 @@ lazy_static::lazy_static! {
         dotenv().ok();
         env::var("API_KEY").expect("API_KEY must be set in .env or environment")
     };
-    pub static ref PORT: u16 = {
+    pub static ref PORT: Vec<u16> = {
         dotenv().ok();
         env::var("PORT")
             .unwrap_or_else(|_| "25565".into())
-            .parse()
-            .expect("PORT must be a valid u16")
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u16>().ok())
+            .collect::<Vec<u16>>()
     };
-    pub static ref UPORT: u16 = {
+    pub static ref UPORT: Vec<u16> = {
         dotenv().ok();
         env::var("UPORT")
             .unwrap_or_else(|_| "19132".into())
-            .parse()
-            .expect("PORT must be a valid u16")
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u16>().ok())
+            .collect::<Vec<u16>>()
     };
     pub static ref HOST: String = {
         dotenv().ok();
@@ -51,57 +53,67 @@ async fn main() {
         console::style("action log for fail2ban or similar like this: ").red(),
         console::style("tcp/25565 abuse detected for ip=the_ip_here").magenta()
     );
-    // Channel for sending IPs to process()
-    let (tx, rx) = std::sync::mpsc::channel::<(SocketAddr, &'static str)>();
-
-    // Arc and Mutex for tracking seen scans
+    let (tx, rx) = std::sync::mpsc::channel::<(SocketAddr, u16, &'static str, &'static str)>();
     let seen_scans = Arc::new(Mutex::new(HashSet::new()));
-
-    // Deduplication map for API requests
     let dedup_map: DedupMap = Arc::new(Mutex::new(HashMap::new()));
 
-    // Spawn the TCP server in a thread
-    let tx_server = tx.clone();
-    thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async move {
-            let listener_udp = UdpSocket::bind(format!("{}:{}", *HOST, *UPORT))
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed to bind UDP socket to port {:#?}: {e}", *UPORT);
-                    std::process::exit(1);
-                });
-            let listener = TcpListener::bind(format!("{}:{}", *HOST, *PORT))
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed to bind to port {:#?}: {e}", *PORT);
-                    std::process::exit(1);
-                });
-            println!("Listening on UDP {}:{}", *HOST, *UPORT);
-            println!("Listening on {}:{}", *HOST, *PORT);
-            loop {
-                match listener_udp.recv_from(&mut [0u8; 1024]).await {
-                    Ok((_, addr)) => {
-                        let tx = tx_server.clone();
-                        let _ = tx.send((addr, "full_conn"));
+    // --- Spawn a thread for each UDP port ---
+    for uport in UPORT.iter().copied() {
+        let tx_udp = tx.clone();
+        let host = HOST.clone();
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let socket = UdpSocket::bind(format!("{}:{}", host, uport))
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("Failed to bind UDP socket to port {:#?}: {e}", uport);
+                        std::process::exit(1);
+                    });
+                println!("Listening on UDP {}:{}", host, uport);
+                let mut buf = [0u8; 2048];
+                loop {
+                    match socket.recv_from(&mut buf).await {
+                        Ok((_, addr)) => {
+                            let _ = tx_udp.send((addr, uport, "full_conn", "udp"));
+                        }
+                        Err(e) => eprintln!("UDP recv error: {e}"),
                     }
-                    Err(e) => eprintln!("UDP recv error: {e}"),
                 }
-                match listener.accept().await {
-                    Ok((mut socket, addr)) => {
-                        let tx = tx_server.clone();
-                        tokio::spawn(async move {
-                            let _ = tx.send((addr, "full_conn"));
-                            tokio::time::sleep(time::Duration::from_secs(1)).await;
-                            // Socket is dropped here
-                            let _ = socket.shutdown().await;
-                        });
-                    }
-                    Err(e) => eprintln!("Accept error: {e}"),
-                }
-            }
+            });
         });
-    });
+    }
+
+    // --- Spawn a thread for each TCP port ---
+    for port in PORT.iter().copied() {
+        let tx_tcp = tx.clone();
+        let host = HOST.clone();
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let listener = TcpListener::bind(format!("{}:{}", host, port))
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("Failed to bind to port {:#?}: {e}", port);
+                        std::process::exit(1);
+                    });
+                println!("Listening on {}:{}", host, port);
+                loop {
+                    match listener.accept().await {
+                        Ok((mut socket, addr)) => {
+                            let tx = tx_tcp.clone();
+                            tokio::spawn(async move {
+                                let _ = tx.send((addr, port, "full_conn", "tcp"));
+                                tokio::time::sleep(time::Duration::from_secs(1)).await;
+                                let _ = socket.shutdown().await;
+                            });
+                        }
+                        Err(e) => eprintln!("Accept error: {e}"),
+                    }
+                }
+            });
+        });
+    }
 
     // Spawn the packet sniffer in a thread for each device
     let tx_sniffer = tx.clone();
@@ -198,7 +210,12 @@ async fn main() {
                                         let key = (src.ip(), src.port());
                                         if !seen.contains(&key) {
                                             seen.insert(key);
-                                            let _ = tx_sniffer.send((src, "syn_scan"));
+                                            let _ = tx_sniffer.send((
+                                                src,
+                                                tcp.destination_port(),
+                                                "syn_scan",
+                                                "tcp",
+                                            ));
                                         }
                                     }
                                 }
@@ -232,23 +249,27 @@ async fn main() {
                                         if let Some(_payload) = pkt.ip_payload() {
                                             // You can add your Bedrock protocol detection here
                                             // For now, just send every UDP packet to process
-                                            let _ = tx_sniffer.send((src, "bedrock_udp"));
+                                            let _ = tx_sniffer.send((
+                                                src,
+                                                udp.destination_port(),
+                                                "bedrock_udp",
+                                                "udp",
+                                            ));
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                };
+                }
             });
         }
     }); // <-- closes the thread::spawn for the sniffer
 
     // --- Main event loop: process incoming IPs from both TCP and sniffer threads ---
-    for (addr, kind) in rx {
+    for (addr, server_port, kind, proto) in rx {
         let dedup_map = dedup_map.clone();
-        // If process returns an error, log it but keep running
-        if let Err(e) = process(addr, kind, dedup_map).await {
+        if let Err(e) = process(addr, server_port, kind, proto, dedup_map).await {
             eprintln!("Error in process(): {e}");
         }
     }
@@ -257,7 +278,9 @@ async fn main() {
 // --- Process function: handles abuse checks and deduplication for each event ---
 async fn process(
     addr: SocketAddr,
+    server_port: u16,
     kind: &str,
+    proto: &str,
     dedup_map: DedupMap,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Always log the event, even if deduplicated
@@ -338,7 +361,11 @@ async fn process(
     if high_abuse || many_reports {
         println!(
             "{}",
-            console::style(format!("tcp/{} abuse detected for ip={}", *PORT, ip)).magenta()
+            console::style(format!(
+                "{}/{} abuse detected for ip={}",
+                proto, server_port, ip
+            ))
+            .magenta()
         );
     }
 
