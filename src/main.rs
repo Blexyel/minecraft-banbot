@@ -3,12 +3,13 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tokio::{io::AsyncWriteExt, net::TcpListener, time};
+use std::{env, time};
+use tokio::net::UdpSocket;
+use tokio::{io::AsyncWriteExt, net::TcpListener};
 
 lazy_static::lazy_static! {
     pub static ref API_KEY: String = {
@@ -19,6 +20,13 @@ lazy_static::lazy_static! {
         dotenv().ok();
         env::var("PORT")
             .unwrap_or_else(|_| "25565".into())
+            .parse()
+            .expect("PORT must be a valid u16")
+    };
+    pub static ref UPORT: u16 = {
+        dotenv().ok();
+        env::var("UPORT")
+            .unwrap_or_else(|_| "19132".into())
             .parse()
             .expect("PORT must be a valid u16")
     };
@@ -57,20 +65,34 @@ async fn main() {
     thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
+            let listener_udp = UdpSocket::bind(format!("{}:{}", *HOST, *UPORT))
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to bind UDP socket to port {:#?}: {e}", *UPORT);
+                    std::process::exit(1);
+                });
             let listener = TcpListener::bind(format!("{}:{}", *HOST, *PORT))
                 .await
                 .unwrap_or_else(|e| {
-                    eprintln!("Failed to bind to port 25565: {e}");
+                    eprintln!("Failed to bind to port {:#?}: {e}", *PORT);
                     std::process::exit(1);
                 });
+            println!("Listening on UDP {}:{}", *HOST, *UPORT);
             println!("Listening on {}:{}", *HOST, *PORT);
             loop {
+                match listener_udp.recv_from(&mut [0u8; 1024]).await {
+                    Ok((_, addr)) => {
+                        let tx = tx_server.clone();
+                        let _ = tx.send((addr, "full_conn"));
+                    }
+                    Err(e) => eprintln!("UDP recv error: {e}"),
+                }
                 match listener.accept().await {
                     Ok((mut socket, addr)) => {
                         let tx = tx_server.clone();
                         tokio::spawn(async move {
                             let _ = tx.send((addr, "full_conn"));
-                            time::sleep(time::Duration::from_secs(1)).await;
+                            tokio::time::sleep(time::Duration::from_secs(1)).await;
                             // Socket is dropped here
                             let _ = socket.shutdown().await;
                         });
@@ -136,19 +158,19 @@ async fn main() {
                         return;
                     }
                 };
-                if let Err(e) = cap.filter("tcp port 25565", true) {
+                if let Err(e) = cap.filter("tcp dst port 25565 or udp dst port 19132", true) {
                     eprintln!("Failed to set filter on {}: {e}", dev_name);
                     return;
                 }
 
                 // Main packet processing loop for this device
                 while let Ok(packet) = cap.next_packet() {
-                    if let Ok(pkt) = SlicedPacket::from_ethernet(&packet.data) {
-                        if let Some(tcp) = pkt.transport {
+                    if let Ok(ref pkt) = SlicedPacket::from_ethernet(&packet.data) {
+                        if let Some(ref tcp) = pkt.transport {
                             if let etherparse::TransportSlice::Tcp(tcp) = tcp {
                                 // Check for SYN and not ACK (SYN scan)
                                 if tcp.syn() && !tcp.ack() && tcp.destination_port() == 25565 {
-                                    if let Some(net) = pkt.net {
+                                    if let Some(ref net) = pkt.net {
                                         let src = match net {
                                             InternetSlice::Ipv4(h) => {
                                                 let hdr = h.header();
@@ -182,11 +204,45 @@ async fn main() {
                                 }
                             }
                         }
+                        if let Some(ref udp) = pkt.transport {
+                            if let etherparse::TransportSlice::Udp(udp) = udp {
+                                if udp.destination_port() == 19132 {
+                                    if let Some(ref net) = pkt.net {
+                                        let src = match net {
+                                            InternetSlice::Ipv4(h) => {
+                                                let hdr = h.header();
+                                                let ip = std::net::Ipv4Addr::from(hdr.source());
+                                                SocketAddr::new(
+                                                    std::net::IpAddr::V4(ip),
+                                                    udp.source_port(),
+                                                )
+                                            }
+                                            InternetSlice::Ipv6(h) => {
+                                                let hdr = h.header();
+                                                let ip = std::net::Ipv6Addr::from(hdr.source());
+                                                SocketAddr::new(
+                                                    std::net::IpAddr::V6(ip),
+                                                    udp.source_port(),
+                                                )
+                                            }
+                                            InternetSlice::Arp(_) => return,
+                                        };
+
+                                        // Parse the UDP payload to distinguish packet types
+                                        if let Some(_payload) = pkt.ip_payload() {
+                                            // You can add your Bedrock protocol detection here
+                                            // For now, just send every UDP packet to process
+                                            let _ = tx_sniffer.send((src, "bedrock_udp"));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
-                }
+                };
             });
         }
-    });
+    }); // <-- closes the thread::spawn for the sniffer
 
     // --- Main event loop: process incoming IPs from both TCP and sniffer threads ---
     for (addr, kind) in rx {
@@ -196,7 +252,7 @@ async fn main() {
             eprintln!("Error in process(): {e}");
         }
     }
-}
+} // <-- closes async fn main
 
 // --- Process function: handles abuse checks and deduplication for each event ---
 async fn process(
@@ -204,9 +260,11 @@ async fn process(
     kind: &str,
     dedup_map: DedupMap,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Always log the event, even if deduplicated
     match kind {
         "full_conn" => println!("Processing FULL connection from: {addr}"),
         "syn_scan" => println!("Detected SYN scan from: {addr}"),
+        "bedrock_udp" => println!("Detected Minecraft Bedrock UDP packet from: {addr}"),
         _ => println!("Unknown event from: {addr}"),
     }
 
@@ -225,7 +283,8 @@ async fn process(
         return Ok(());
     }
 
-    // Deduplication: Only allow one request per IP per DEDUP_WINDOW
+    // Only deduplicate API requests, not logs
+    let mut do_lookup = true;
     {
         let mut map = dedup_map.lock().unwrap_or_else(|e| {
             eprintln!("Failed to lock dedup_map: {e}");
@@ -235,10 +294,16 @@ async fn process(
         if let Some(&last) = map.get(&ip) {
             if now.duration_since(last) < DEDUP_WINDOW {
                 println!("Skipping API request for {} (deduplicated)", ip);
-                return Ok(());
+                do_lookup = false;
             }
         }
-        map.insert(ip, now);
+        if do_lookup {
+            map.insert(ip, now);
+        }
+    }
+
+    if !do_lookup {
+        return Ok(());
     }
 
     // --- AbuseIPDB API request and response handling ---
