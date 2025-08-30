@@ -43,7 +43,7 @@ lazy_static::lazy_static! {
 }
 
 type DedupMap = Arc<Mutex<HashMap<std::net::IpAddr, Instant>>>;
-const DEDUP_WINDOW: Duration = Duration::from_secs(30);
+const DEDUP_WINDOW: Duration = Duration::from_secs(1800);
 
 #[tokio::main]
 async fn main() {
